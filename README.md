@@ -468,6 +468,22 @@ Use the setup window to detect the correct IDs.
 
 ---
 
+## Virtual audio drivers
+
+This project does not include VB-CABLE or VoiceMeeter installers.
+
+Please download them from the official VB-Audio websites:
+
+- VB-CABLE: https://vb-audio.com/Cable/index.htm
+- VoiceMeeter: https://vb-audio.com/Voicemeeter/
+
+You can open both pages with:
+
+```bash
+npm run downloads
+
+---
+
 ## `.env.example`
 
 Create a public `.env.example` file like this:

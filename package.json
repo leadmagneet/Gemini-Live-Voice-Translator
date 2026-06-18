@@ -1,0 +1,30 @@
+{
+  "name": "gemini-live-voice-translator",
+  "version": "1.0.0",
+  "description": "Windows real-time speech-to-speech meeting translator using Gemini Live Translate, VB-CABLE, VoiceMeeter, and audify.",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "config": "node config-window.js",
+    "devices": "node devices.js",
+    "downloads": "node open-downloads.js"
+  },
+  "keywords": [
+    "gemini",
+    "live-translate",
+    "speech-to-speech",
+    "voice-translator",
+    "windows",
+    "wasapi",
+    "voicemeeter",
+    "vb-cable"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "audify": "^1.10.1",
+    "dotenv": "^17.4.2",
+    "ws": "^8.21.0"
+  }
+}
