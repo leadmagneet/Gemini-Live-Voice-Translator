@@ -22,28 +22,19 @@ const WASAPI_API = 7;
 const REAL_MIC_ID = Number(process.env.REAL_MIC_ID || 148);
 
 // VB-CABLE Input.
-// Node пишет сюда переведённый звук, конференция читает CABLE Output.
 const CABLE_INPUT_ID = Number(process.env.CABLE_INPUT_ID || 132);
 
 // VoiceMeeter Out B1.
-// Node читает отсюда звук конференции.
 const VOICEMEETER_OUT_ID = Number(process.env.VOICEMEETER_OUT_ID || 146);
 
-// Куда отправлять перевод тебе.
-// Если наушники отдельным устройством — сюда ID наушников.
-// Если jack-наушники через Realtek — часто это "Динамики Realtek".
 const REAL_PHONES_ID = Number(process.env.REAL_PHONES_ID || 135);
 
 // =====================================================
 // TRANSLATION DIRECTIONS
 // =====================================================
 
-// Твоя речь -> перевод -> в конференцию
-// Для схемы RU -> EN ставь en
 const OUTGOING_TARGET_LANG = process.env.OUTGOING_TARGET_LANG || 'en';
 
-// Звук конференции -> перевод -> тебе в наушники
-// Для схемы EN -> RU ставь ru
 const INCOMING_TARGET_LANG = process.env.INCOMING_TARGET_LANG || 'ru';
 
 const OUTGOING_PIPELINE_NAME =
@@ -61,11 +52,8 @@ const URL =
   `wss://generativelanguage.googleapis.com/ws/` +
   `google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${API_KEY}`;
 
-// Транскрипты нужны только для логов.
-// Это не текстовый ввод.
 let runtimeEnableTranscripts = process.env.ENABLE_TRANSCRIPTS !== '0';
 
-// По умолчанию выключено, потому что у тебя стабильнее без этого.
 let runtimeEnableRealtimeInputConfig = process.env.REALTIME_INPUT_CONFIG === '1';
 
 // =====================================================
@@ -77,7 +65,6 @@ const OUTPUT_RATE = 24000;
 const CHANNELS = 1;
 const BYTES_PER_SAMPLE = 2;
 
-// Стабильные значения.
 const CAPTURE_FRAMES = Number(process.env.CAPTURE_FRAMES || 800);     // 50 ms at 16 kHz
 const PLAYBACK_FRAMES = Number(process.env.PLAYBACK_FRAMES || 480);   // 20 ms at 24 kHz
 
@@ -226,8 +213,6 @@ class RtAudioWritePlayer {
 
     this.running = true;
 
-    // 4 * 20 ms = около 80 ms стартового буфера.
-    // Это стабильнее, чем 1 frame, но почти не даёт задержки.
     for (let i = 0; i < 4; i++) {
       this.writeNextFrame();
     }
@@ -419,9 +404,6 @@ class TranslationPipeline {
         this.ready = false;
       }
 
-      // ВАЖНО:
-      // Каждый пайплайн чистит только свои очереди.
-      // Второй пайплайн не трогаем.
       this.captureQueue.clear();
       this.playbackQueue.clear();
 
@@ -539,7 +521,6 @@ class TranslationPipeline {
 
   pumpCapture() {
     if (!this.ready) {
-      // Не отправляем старый звук после reconnect.
       this.captureQueue.clear();
       return;
     }
@@ -666,8 +647,6 @@ class TranslationPipeline {
 // PIPELINES
 // =====================================================
 
-// PIPELINE 1:
-// Твоя речь -> перевод -> в конференцию через VB-CABLE
 const outgoingPipeline = new TranslationPipeline({
   name: OUTGOING_PIPELINE_NAME,
   targetLanguageCode: OUTGOING_TARGET_LANG,
@@ -680,7 +659,6 @@ const outgoingPipeline = new TranslationPipeline({
 });
 
 // PIPELINE 2:
-// Звук конференции -> перевод -> тебе в наушники
 const incomingPipeline = new TranslationPipeline({
   name: INCOMING_PIPELINE_NAME,
   targetLanguageCode: INCOMING_TARGET_LANG,
