@@ -2,6 +2,8 @@ require('dotenv').config();
 
 const WebSocket = require('ws');
 const { RtAudio, RtAudioFormat } = require('audify');
+const fs = require('fs');
+const path = require('path');
 
 // =====================================================
 // ENV
@@ -22,19 +24,28 @@ const WASAPI_API = 7;
 const REAL_MIC_ID = Number(process.env.REAL_MIC_ID || 148);
 
 // VB-CABLE Input.
+// Node пишет сюда переведённый звук, конференция читает CABLE Output.
 const CABLE_INPUT_ID = Number(process.env.CABLE_INPUT_ID || 132);
 
 // VoiceMeeter Out B1.
+// Node читает отсюда звук конференции.
 const VOICEMEETER_OUT_ID = Number(process.env.VOICEMEETER_OUT_ID || 146);
 
+// Куда отправлять перевод тебе.
+// Если наушники отдельным устройством — сюда ID наушников.
+// Если jack-наушники через Realtek — часто это "Динамики Realtek".
 const REAL_PHONES_ID = Number(process.env.REAL_PHONES_ID || 135);
 
 // =====================================================
 // TRANSLATION DIRECTIONS
 // =====================================================
 
+// Твоя речь -> перевод -> в конференцию
+// Для схемы RU -> EN ставь en
 const OUTGOING_TARGET_LANG = process.env.OUTGOING_TARGET_LANG || 'en';
 
+// Звук конференции -> перевод -> тебе в наушники
+// Для схемы EN -> RU ставь ru
 const INCOMING_TARGET_LANG = process.env.INCOMING_TARGET_LANG || 'ru';
 
 const OUTGOING_PIPELINE_NAME =
@@ -52,8 +63,11 @@ const URL =
   `wss://generativelanguage.googleapis.com/ws/` +
   `google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${API_KEY}`;
 
+// Транскрипты нужны только для логов.
+// Это не текстовый ввод.
 let runtimeEnableTranscripts = process.env.ENABLE_TRANSCRIPTS !== '0';
 
+// По умолчанию выключено, потому что у тебя стабильнее без этого.
 let runtimeEnableRealtimeInputConfig = process.env.REALTIME_INPUT_CONFIG === '1';
 
 // =====================================================
@@ -65,6 +79,7 @@ const OUTPUT_RATE = 24000;
 const CHANNELS = 1;
 const BYTES_PER_SAMPLE = 2;
 
+// Стабильные значения.
 const CAPTURE_FRAMES = Number(process.env.CAPTURE_FRAMES || 800);     // 50 ms at 16 kHz
 const PLAYBACK_FRAMES = Number(process.env.PLAYBACK_FRAMES || 480);   // 20 ms at 24 kHz
 
@@ -194,6 +209,250 @@ class ByteQueue {
 }
 
 // =====================================================
+// SESSION RECORDING (optional, RECORD_SESSION=1)
+// =====================================================
+const RECORD_SESSION = process.env.RECORD_SESSION === '1';
+
+let sessionDir = null;
+let transcriptStream = null;
+const allRecorders = [];
+
+// Two combined call recordings (both directions mixed into one file each).
+let originalTrack = null;    // your mic + the other person's real voice (16 kHz)
+let translatedTrack = null;  // your translated EN + incoming translated RU (24 kHz)
+
+function initSessionLogging() {
+  if (!RECORD_SESSION) return;
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  sessionDir = path.join(__dirname, 'logs', stamp);
+
+  fs.mkdirSync(sessionDir, { recursive: true });
+
+  transcriptStream = fs.createWriteStream(
+    path.join(sessionDir, 'transcript.log'),
+    { flags: 'a' }
+  );
+
+  originalTrack = new MixTrack(path.join(sessionDir, 'original.wav'), INPUT_RATE);
+  translatedTrack = new MixTrack(path.join(sessionDir, 'translated.wav'), OUTPUT_RATE);
+
+  console.log(`[SYSTEM] RECORD_SESSION=1 -> writing original.wav + translated.wav + transcript to ${sessionDir}`);
+}
+
+function logTranscript(line) {
+  if (!transcriptStream) return;
+  transcriptStream.write(`[${new Date().toISOString()}] ${line}\n`);
+}
+
+function finalizeRecordings(done) {
+  const open = allRecorders.filter((r) => !r.closed);
+
+  let pending = open.length;
+  let finished = false;
+
+  const finishAll = () => {
+    if (finished) return;
+    finished = true;
+
+    if (transcriptStream) {
+      try { transcriptStream.end(); } catch (_) {}
+    }
+
+    done();
+  };
+
+  if (pending === 0) {
+    finishAll();
+    return;
+  }
+
+  for (const r of open) {
+    r.close(() => {
+      pending--;
+      if (pending <= 0) finishAll();
+    });
+  }
+
+  // Safety net so we never hang on exit.
+  setTimeout(finishAll, 2000);
+}
+
+// Streams 16-bit PCM into a .wav file. Header is written as a placeholder
+// and patched with the real sizes on graceful shutdown (Ctrl+C).
+class WavRecorder {
+  constructor(filePath, sampleRate) {
+    this.filePath = filePath;
+    this.sampleRate = sampleRate;
+    this.channels = CHANNELS;
+    this.dataBytes = 0;
+    this.closed = false;
+
+    this.stream = fs.createWriteStream(filePath);
+    this.stream.write(this._header(0));
+
+    // Periodically rewrite the header so the file stays playable even if the
+    // process is killed without a graceful shutdown (crash / force-kill).
+    this.flushTimer = setInterval(() => this._patchHeader(), 3000);
+    if (this.flushTimer.unref) this.flushTimer.unref();
+  }
+
+  _patchHeader() {
+    if (this.closed) return;
+
+    try {
+      const fd = fs.openSync(this.filePath, 'r+');
+      fs.writeSync(fd, this._header(this.dataBytes), 0, 44, 0);
+      fs.closeSync(fd);
+    } catch (_) {
+      // File may be briefly locked; the next tick will retry.
+    }
+  }
+
+  _header(dataLen) {
+    const buf = Buffer.alloc(44);
+    const byteRate = this.sampleRate * this.channels * BYTES_PER_SAMPLE;
+    const blockAlign = this.channels * BYTES_PER_SAMPLE;
+
+    buf.write('RIFF', 0);
+    buf.writeUInt32LE(36 + dataLen, 4);
+    buf.write('WAVE', 8);
+    buf.write('fmt ', 12);
+    buf.writeUInt32LE(16, 16);
+    buf.writeUInt16LE(1, 20);            // PCM
+    buf.writeUInt16LE(this.channels, 22);
+    buf.writeUInt32LE(this.sampleRate, 24);
+    buf.writeUInt32LE(byteRate, 28);
+    buf.writeUInt16LE(blockAlign, 32);
+    buf.writeUInt16LE(BYTES_PER_SAMPLE * 8, 34);
+    buf.write('data', 36);
+    buf.writeUInt32LE(dataLen, 40);
+
+    return buf;
+  }
+
+  write(buffer) {
+    if (this.closed || !buffer || buffer.length === 0) return;
+
+    this.dataBytes += buffer.length;
+    this.stream.write(Buffer.from(buffer));
+  }
+
+  close(done) {
+    if (this.closed) {
+      if (done) done();
+      return;
+    }
+
+    this.closed = true;
+    clearInterval(this.flushTimer);
+
+    this.stream.end(() => {
+      try {
+        const fd = fs.openSync(this.filePath, 'r+');
+        fs.writeSync(fd, this._header(this.dataBytes), 0, 44, 0);
+        fs.closeSync(fd);
+      } catch (err) {
+        console.error(`[REC] Failed to finalize ${this.filePath}:`, err.message);
+      }
+
+      if (done) done();
+    });
+  }
+}
+
+// Mixes several PCM sources into ONE mono .wav on a shared wall-clock timeline.
+// Each source's chunk is placed at the moment it arrives, overlapping audio is
+// summed (clamped to int16). Used to produce two combined call recordings:
+//   - original.wav   = your mic + the other person's real voice
+//   - translated.wav = your translated EN + the incoming translated RU
+class MixTrack {
+  constructor(filePath, sampleRate) {
+    this.rate = sampleRate;
+    this.startTime = Date.now();
+    this.baseSample = 0;          // samples already flushed to the file
+    this.acc = new Int32Array(sampleRate); // pending (un-flushed) samples
+    this.accLen = 0;
+    this.closed = false;
+
+    this.recorder = new WavRecorder(filePath, sampleRate);
+
+    // Flush completed samples to disk regularly.
+    this.flushTimer = setInterval(() => this.flush(), 200);
+    if (this.flushTimer.unref) this.flushTimer.unref();
+
+    allRecorders.push(this);
+  }
+
+  _ensure(len) {
+    if (len <= this.acc.length) return;
+    let size = this.acc.length;
+    while (size < len) size *= 2;
+    const next = new Int32Array(size);
+    next.set(this.acc.subarray(0, this.accLen));
+    this.acc = next;
+  }
+
+  add(int16buf) {
+    if (this.closed || !int16buf || int16buf.length < 2) return;
+
+    const n = int16buf.length >> 1;
+    let idx = Math.round((Date.now() - this.startTime) / 1000 * this.rate) - this.baseSample;
+    if (idx < 0) idx = 0;
+
+    const end = idx + n;
+    this._ensure(end);
+    if (end > this.accLen) this.accLen = end;
+
+    for (let i = 0; i < n; i++) {
+      this.acc[idx + i] += int16buf.readInt16LE(i << 1);
+    }
+  }
+
+  _drain(count) {
+    const out = Buffer.allocUnsafe(count * 2);
+    for (let i = 0; i < count; i++) {
+      let s = this.acc[i];
+      if (s > 32767) s = 32767;
+      else if (s < -32768) s = -32768;
+      out.writeInt16LE(s, i << 1);
+    }
+    this.recorder.write(out);
+
+    // Shift remaining samples to the front and zero the vacated tail.
+    this.acc.copyWithin(0, count, this.accLen);
+    this.accLen -= count;
+    this.acc.fill(0, this.accLen);
+    this.baseSample += count;
+  }
+
+  flush() {
+    if (this.closed || this.accLen === 0) return;
+
+    // Keep the last 400 ms in memory so late-arriving overlaps still mix.
+    const margin = Math.round(this.rate * 0.4);
+    const nowIdx = Math.round((Date.now() - this.startTime) / 1000 * this.rate) - this.baseSample;
+
+    const count = Math.min(this.accLen, nowIdx - margin);
+    if (count > 0) this._drain(count);
+  }
+
+  close(done) {
+    if (this.closed) {
+      if (done) done();
+      return;
+    }
+
+    this.closed = true;
+    clearInterval(this.flushTimer);
+
+    if (this.accLen > 0) this._drain(this.accLen);
+
+    this.recorder.close(done);
+  }
+}
+
+// =====================================================
 // AUDIFY OUTPUT PLAYER
 // =====================================================
 class RtAudioWritePlayer {
@@ -213,6 +472,8 @@ class RtAudioWritePlayer {
 
     this.running = true;
 
+    // 4 * 20 ms = около 80 ms стартового буфера.
+    // Это стабильнее, чем 1 frame, но почти не даёт задержки.
     for (let i = 0; i < 4; i++) {
       this.writeNextFrame();
     }
@@ -404,6 +665,9 @@ class TranslationPipeline {
         this.ready = false;
       }
 
+      // ВАЖНО:
+      // Каждый пайплайн чистит только свои очереди.
+      // Второй пайплайн не трогаем.
       this.captureQueue.clear();
       this.playbackQueue.clear();
 
@@ -443,10 +707,12 @@ class TranslationPipeline {
 
     if (content.inputTranscription?.text) {
       console.log(`[${this.name} INPUT] ${content.inputTranscription.text}`);
+      logTranscript(`[${this.name} INPUT] ${content.inputTranscription.text}`);
     }
 
     if (content.outputTranscription?.text) {
       console.log(`[${this.name} OUTPUT] ${content.outputTranscription.text}`);
+      logTranscript(`[${this.name} OUTPUT] ${content.outputTranscription.text}`);
     }
 
     if (content.modelTurn?.parts) {
@@ -460,6 +726,7 @@ class TranslationPipeline {
         ) {
           const audio = Buffer.from(inlineData.data, 'base64');
           this.playbackQueue.push(audio);
+          if (translatedTrack) translatedTrack.add(audio);
         }
       }
     }
@@ -521,6 +788,7 @@ class TranslationPipeline {
 
   pumpCapture() {
     if (!this.ready) {
+      // Не отправляем старый звук после reconnect.
       this.captureQueue.clear();
       return;
     }
@@ -553,6 +821,7 @@ class TranslationPipeline {
         this.inputStreamName,
         (inputBuffer) => {
           this.captureQueue.push(inputBuffer);
+          if (originalTrack) originalTrack.add(inputBuffer);
         },
         null
       );
@@ -647,6 +916,11 @@ class TranslationPipeline {
 // PIPELINES
 // =====================================================
 
+// Must run before pipelines are constructed (recorders use sessionDir).
+initSessionLogging();
+
+// PIPELINE 1:
+// Твоя речь -> перевод -> в конференцию через VB-CABLE
 const outgoingPipeline = new TranslationPipeline({
   name: OUTGOING_PIPELINE_NAME,
   targetLanguageCode: OUTGOING_TARGET_LANG,
@@ -659,6 +933,7 @@ const outgoingPipeline = new TranslationPipeline({
 });
 
 // PIPELINE 2:
+// Звук конференции -> перевод -> тебе в наушники
 const incomingPipeline = new TranslationPipeline({
   name: INCOMING_PIPELINE_NAME,
   targetLanguageCode: INCOMING_TARGET_LANG,
@@ -693,7 +968,12 @@ function shutdown() {
     }
   }
 
-  process.exit(0);
+  finalizeRecordings(() => {
+    if (sessionDir) {
+      console.log(`[SYSTEM] Recordings saved to ${sessionDir}`);
+    }
+    process.exit(0);
+  });
 }
 
 process.on('SIGINT', shutdown);

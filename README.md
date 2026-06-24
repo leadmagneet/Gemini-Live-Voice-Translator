@@ -102,6 +102,7 @@ https://ai.google.dev/gemini-api/docs/live-api/live-translate
 - Input RMS test
 - Output beep test
 - `.env` generator
+- No Express, Electron, or extra UI framework required for the setup window
 
 ---
 
